@@ -538,12 +538,8 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
     return paFormatIsSupported;
 }
 
-typedef struct OpenslesStream
+typedef struct OpenslesOutputStream
 {
-    PaUtilStreamRepresentation streamRepresentation;
-    PaUtilCpuLoadMeasurer cpuLoadMeasurer;
-    PaUtilBufferProcessor bufferProcessor;
-
     SLObjectItf audioPlayer;
     SLObjectItf outputMixObject;
     SLPlayItf playerItf;
@@ -552,10 +548,36 @@ typedef struct OpenslesStream
     SLVolumeItf volumeItf;
     SLAndroidConfigurationItf outputConfigurationItf;
 
+    sem_t outputSem;
+
+    void **outputBuffers;
+    int currentOutputBuffer;
+
+    unsigned bytesPerSample;
+}
+OpenslesOutputStream;
+
+typedef struct OpenslesInputStream
+{
     SLObjectItf audioRecorder;
     SLRecordItf recorderItf;
     SLAndroidSimpleBufferQueueItf inputBufferQueueItf;
     SLAndroidConfigurationItf inputConfigurationItf;
+
+    sem_t inputSem;
+
+    void **inputBuffers;
+    int currentInputBuffer;
+
+    unsigned bytesPerSample;
+}
+OpenslesInputStream;
+
+typedef struct OpenslesStream
+{
+    PaUtilStreamRepresentation streamRepresentation;
+    PaUtilCpuLoadMeasurer cpuLoadMeasurer;
+    PaUtilBufferProcessor bufferProcessor;
 
     SLboolean isBlocking;
     SLboolean isStopped;
@@ -566,19 +588,15 @@ typedef struct OpenslesStream
     SLboolean hasInput;
 
     int callbackResult;
-    sem_t outputSem;
-    sem_t inputSem;
 
     PaStreamCallbackFlags cbFlags;
     PaUnixThread streamThread;
 
-    void **outputBuffers;
-    int currentOutputBuffer;
-    void **inputBuffers;
-    int currentInputBuffer;
-
     unsigned long framesPerHostCallback;
-    unsigned bytesPerFrame;
+
+    OpenslesOutputStream *outputStream;
+    OpenslesInputStream *inputStream;
+
 }
 OpenslesStream;
 
@@ -709,6 +727,8 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         result = paInsufficientMemory;
         goto error;
     }
+    stream->inputStream = 0;
+    stream->outputStream = 0;
 
     if( streamCallback )
     {
@@ -735,7 +755,6 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     stream->streamRepresentation.streamInfo.sampleRate = sampleRate;
     stream->isBlocking = streamCallback ? SL_BOOLEAN_FALSE : SL_BOOLEAN_TRUE;
     stream->framesPerHostCallback = framesPerHostBuffer;
-    stream->bytesPerFrame = sizeof(SLint16);
     stream->cbFlags = 0;
     stream->isStopped = SL_BOOLEAN_TRUE;
     stream->isActive = SL_BOOLEAN_FALSE;
@@ -745,7 +764,14 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
 
     if( inputChannelCount > 0 )
     {
+        stream->inputStream = (OpenslesInputStream *)PaUtil_AllocateMemory( sizeof(OpenslesInputStream) );
+        if( !stream->inputStream ) {
+            result = paInsufficientMemory;
+            goto error;
+        }
+
         stream->hasInput = SL_BOOLEAN_TRUE;
+        stream->inputStream->bytesPerSample = sizeof(SLint16);
         stream->streamRepresentation.streamInfo.inputLatency =
             ((PaTime)PaUtil_GetBufferProcessorInputLatencyFrames(&stream->bufferProcessor)
              + stream->framesPerHostCallback) / sampleRate;
@@ -757,7 +783,14 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
 
     if( outputChannelCount > 0 )
     {
+        stream->outputStream = (OpenslesOutputStream *)PaUtil_AllocateMemory( sizeof(OpenslesOutputStream) );
+        if( !stream->outputStream ) {
+            result = paInsufficientMemory;
+            goto error;
+        }
+
         stream->hasOutput = SL_BOOLEAN_TRUE;
+        stream->outputStream->bytesPerSample = sizeof(SLint16);
         stream->streamRepresentation.streamInfo.outputLatency =
             ((PaTime)PaUtil_GetBufferProcessorOutputLatencyFrames(&stream->bufferProcessor)
              + stream->framesPerHostCallback) / sampleRate;
@@ -771,8 +804,13 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     return result;
 
 error:
-    if( stream )
+    if( stream ) {
+        if( stream->inputStream )
+            PaUtil_FreeMemory( stream->inputStream );
+        if( stream->outputStream )
+            PaUtil_FreeMemory( stream->outputStream );
         PaUtil_FreeMemory( stream );
+    }
     return result;
 }
 
@@ -788,9 +826,9 @@ static PaError InitializeOutputStream(PaOpenslesHostApiRepresentation *openslesH
                                     channelMasks[stream->bufferProcessor.outputChannelCount - 1], SL_BYTEORDER_LITTLEENDIAN };
     SLDataSource audioSrc = { &outputBQLocator, &formatPcm };
 
-    (*openslesHostApi->slEngineItf)->CreateOutputMix( openslesHostApi->slEngineItf, &stream->outputMixObject, 0, NULL, NULL );
-    (*stream->outputMixObject)->Realize( stream->outputMixObject, SL_BOOLEAN_FALSE );
-    SLDataLocator_OutputMix outputLocator = { SL_DATALOCATOR_OUTPUTMIX, stream->outputMixObject };
+    (*openslesHostApi->slEngineItf)->CreateOutputMix( openslesHostApi->slEngineItf, &stream->outputStream->outputMixObject, 0, NULL, NULL );
+    (*stream->outputStream->outputMixObject)->Realize( stream->outputStream->outputMixObject, SL_BOOLEAN_FALSE );
+    SLDataLocator_OutputMix outputLocator = { SL_DATALOCATOR_OUTPUTMIX, stream->outputStream->outputMixObject };
     SLDataSink audioSink = { &outputLocator, &formatPcm };
 
     if( !stream->isBlocking )
@@ -798,7 +836,7 @@ static PaError InitializeOutputStream(PaOpenslesHostApiRepresentation *openslesH
         const SLInterfaceID ids[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME, SL_IID_ANDROIDCONFIGURATION };
         const SLboolean req[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
         const unsigned interfaceCount = 3;
-        slResult = (*openslesHostApi->slEngineItf)->CreateAudioPlayer(openslesHostApi->slEngineItf, &stream->audioPlayer,
+        slResult = (*openslesHostApi->slEngineItf)->CreateAudioPlayer(openslesHostApi->slEngineItf, &stream->outputStream->audioPlayer,
                                                                       &audioSrc, &audioSink, interfaceCount, ids, req);
     }
     else
@@ -806,56 +844,56 @@ static PaError InitializeOutputStream(PaOpenslesHostApiRepresentation *openslesH
         const SLInterfaceID ids[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME, SL_IID_ANDROIDCONFIGURATION };
         const SLboolean req[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
         const unsigned interfaceCount = 3;
-        slResult = (*openslesHostApi->slEngineItf)->CreateAudioPlayer( openslesHostApi->slEngineItf, &stream->audioPlayer,
+        slResult = (*openslesHostApi->slEngineItf)->CreateAudioPlayer( openslesHostApi->slEngineItf, &stream->outputStream->audioPlayer,
                                                                        &audioSrc, &audioSink, interfaceCount, ids, req );
     }
     if( slResult != SL_RESULT_SUCCESS )
     {
-        (*stream->outputMixObject)->Destroy( stream->outputMixObject );
+        (*stream->outputStream->outputMixObject)->Destroy( stream->outputStream->outputMixObject );
         result = paUnanticipatedHostError;
         goto error;
     }
 
 #if __ANDROID_API__ >= 14
-    (*stream->audioPlayer)->GetInterface( stream->audioPlayer, SL_IID_ANDROIDCONFIGURATION, &stream->outputConfigurationItf );
-    (*stream->outputConfigurationItf)->SetConfiguration( stream->outputConfigurationItf, SL_ANDROID_KEY_STREAM_TYPE,
+    (*stream->outputStream->audioPlayer)->GetInterface( stream->outputStream->audioPlayer, SL_IID_ANDROIDCONFIGURATION, &stream->outputStream->outputConfigurationItf );
+    (*stream->outputStream->outputConfigurationItf)->SetConfiguration( stream->outputStream->outputConfigurationItf, SL_ANDROID_KEY_STREAM_TYPE,
                                                    &androidPlaybackStreamType, sizeof(androidPlaybackStreamType) );
 #endif
 
-    slResult = (*stream->audioPlayer)->Realize( stream->audioPlayer, SL_BOOLEAN_FALSE );
+    slResult = (*stream->outputStream->audioPlayer)->Realize( stream->outputStream->audioPlayer, SL_BOOLEAN_FALSE );
     if( slResult != SL_RESULT_SUCCESS )
     {
-        (*stream->audioPlayer)->Destroy( stream->audioPlayer );
-        (*stream->outputMixObject)->Destroy( stream->outputMixObject );
+        (*stream->outputStream->audioPlayer)->Destroy( stream->outputStream->audioPlayer );
+        (*stream->outputStream->outputMixObject)->Destroy( stream->outputStream->outputMixObject );
         result = paUnanticipatedHostError;
         goto error;
     }
 
-    (*stream->audioPlayer)->GetInterface( stream->audioPlayer, SL_IID_PLAY, &stream->playerItf );
-    (*stream->audioPlayer)->GetInterface( stream->audioPlayer, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &stream->outputBufferQueueItf );
-    (*stream->audioPlayer)->GetInterface( stream->audioPlayer, SL_IID_VOLUME, &stream->volumeItf );
+    (*stream->outputStream->audioPlayer)->GetInterface( stream->outputStream->audioPlayer, SL_IID_PLAY, &stream->outputStream->playerItf );
+    (*stream->outputStream->audioPlayer)->GetInterface( stream->outputStream->audioPlayer, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &stream->outputStream->outputBufferQueueItf );
+    (*stream->outputStream->audioPlayer)->GetInterface( stream->outputStream->audioPlayer, SL_IID_VOLUME, &stream->outputStream->volumeItf );
 
-    stream->outputBuffers = (void **) PaUtil_AllocateMemory( numberOfBuffers * sizeof(SLint16 *) );
+    stream->outputStream->outputBuffers = (void **) PaUtil_AllocateMemory( numberOfBuffers * sizeof(SLint16 *) );
     for( i = 0; i < numberOfBuffers; ++i )
     {
-        stream->outputBuffers[i] = (void*) PaUtil_AllocateMemory( stream->framesPerHostCallback * stream->bytesPerFrame
+        stream->outputStream->outputBuffers[i] = (void*) PaUtil_AllocateMemory( stream->framesPerHostCallback * stream->outputStream->bytesPerSample
                                                                   * stream->bufferProcessor.outputChannelCount );
-        if( !stream->outputBuffers[i] )
+        if( !stream->outputStream->outputBuffers[i] )
         {
             for( j = 0; j < i; ++j )
-                PaUtil_FreeMemory( stream->outputBuffers[j] );
-            PaUtil_FreeMemory( stream->outputBuffers );
-            (*stream->audioPlayer)->Destroy( stream->audioPlayer );
-            (*stream->outputMixObject)->Destroy( stream->outputMixObject );
+                PaUtil_FreeMemory( stream->outputStream->outputBuffers[j] );
+            PaUtil_FreeMemory( stream->outputStream->outputBuffers );
+            (*stream->outputStream->audioPlayer)->Destroy( stream->outputStream->audioPlayer );
+            (*stream->outputStream->outputMixObject)->Destroy( stream->outputStream->outputMixObject );
             result = paInsufficientMemory;
             goto error;
         }
     }
-    stream->currentOutputBuffer = 0;
+    stream->outputStream->currentOutputBuffer = 0;
 
     if( !stream->isBlocking )
     {
-        /* (*stream->audioPlayer)->GetInterface( stream->audioPlayer, SL_IID_PREFETCHSTATUS, &stream->prefetchStatusItf );
+        /* (*stream->outputStream->audioPlayer)->GetInterface( stream->outputStream->audioPlayer, SL_IID_PREFETCHSTATUS, &stream->prefetchStatusItf );
          * (*stream->prefetchStatusItf)->SetCallbackEventsMask( stream->prefetchStatusItf,
          *                                                      SL_PREFETCHEVENT_STATUSCHANGE );
          * (*stream->prefetchStatusItf)->SetFillUpdatePeriod( stream->prefetchStatusItf, 200 );
@@ -863,8 +901,8 @@ static PaError InitializeOutputStream(PaOpenslesHostApiRepresentation *openslesH
          * (*stream->prefetchStatusItf)->RegisterCallback( stream->prefetchStatusItf, PrefetchStatusCallback, (void*) stream );
          */
     }
-    (*stream->outputBufferQueueItf)->RegisterCallback( stream->outputBufferQueueItf, NotifyBufferFreeCallback, &stream->outputSem );
-    sem_init( &stream->outputSem, 0, 0 );
+    (*stream->outputStream->outputBufferQueueItf)->RegisterCallback( stream->outputStream->outputBufferQueueItf, NotifyBufferFreeCallback, &stream->outputStream->outputSem );
+    sem_init( &stream->outputStream->outputSem, 0, 0 );
 
 error:
     return result;
@@ -896,7 +934,7 @@ static PaError InitializeInputStream( PaOpenslesHostApiRepresentation *openslesH
     const SLInterfaceID ids[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_ANDROIDCONFIGURATION };
     const SLboolean req[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
     const unsigned interfaceCount = 2;
-    slResult = (*openslesHostApi->slEngineItf)->CreateAudioRecorder(openslesHostApi->slEngineItf, &stream->audioRecorder,
+    slResult = (*openslesHostApi->slEngineItf)->CreateAudioRecorder(openslesHostApi->slEngineItf, &stream->inputStream->audioRecorder,
                                                                     &audioSrc, &audioSink, interfaceCount, ids, req);
 
     if( slResult != SL_RESULT_SUCCESS )
@@ -907,46 +945,46 @@ static PaError InitializeInputStream( PaOpenslesHostApiRepresentation *openslesH
     }
 
 #if __ANDROID_API__ >= 14
-    (*stream->audioRecorder)->GetInterface( stream->audioRecorder, SL_IID_ANDROIDCONFIGURATION, &stream->inputConfigurationItf );
-    (*stream->inputConfigurationItf)->SetConfiguration( stream->inputConfigurationItf, SL_ANDROID_KEY_STREAM_TYPE,
+    (*stream->inputStream->audioRecorder)->GetInterface( stream->inputStream->audioRecorder, SL_IID_ANDROIDCONFIGURATION, &stream->inputStream->inputConfigurationItf );
+    (*stream->inputStream->inputConfigurationItf)->SetConfiguration( stream->inputStream->inputConfigurationItf, SL_ANDROID_KEY_STREAM_TYPE,
                                                    &androidRecordingPreset, sizeof(androidRecordingPreset) );
 #endif
 
-    slResult = (*stream->audioRecorder)->Realize( stream->audioRecorder, SL_BOOLEAN_FALSE );
+    slResult = (*stream->inputStream->audioRecorder)->Realize( stream->inputStream->audioRecorder, SL_BOOLEAN_FALSE );
     if( slResult != SL_RESULT_SUCCESS )
     {
-        (*stream->audioRecorder)->Destroy( stream->audioRecorder );
+        (*stream->inputStream->audioRecorder)->Destroy( stream->inputStream->audioRecorder );
         result = paUnanticipatedHostError;
         goto error;
     }
 
-    (*stream->audioRecorder)->GetInterface( stream->audioRecorder,
+    (*stream->inputStream->audioRecorder)->GetInterface( stream->inputStream->audioRecorder,
                                             SL_IID_ANDROIDSIMPLEBUFFERQUEUE,
-                                            &stream->inputBufferQueueItf );
-    (*stream->audioRecorder)->GetInterface( stream->audioRecorder,
+                                            &stream->inputStream->inputBufferQueueItf );
+    (*stream->inputStream->audioRecorder)->GetInterface( stream->inputStream->audioRecorder,
                                             SL_IID_RECORD,
-                                            &stream->recorderItf );
+                                            &stream->inputStream->recorderItf );
 
-    stream->inputBuffers = (void **) PaUtil_AllocateMemory( numberOfBuffers * sizeof(SLint16 *) );
+    stream->inputStream->inputBuffers = (void **) PaUtil_AllocateMemory( numberOfBuffers * sizeof(SLint16 *) );
     for( i = 0; i < numberOfBuffers; ++i )
     {
-        stream->inputBuffers[i] = (void*) PaUtil_AllocateMemory( stream->framesPerHostCallback
-                                                                 * stream->bytesPerFrame
+        stream->inputStream->inputBuffers[i] = (void*) PaUtil_AllocateMemory( stream->framesPerHostCallback
+                                                                 * stream->inputStream->bytesPerSample
                                                                  * stream->bufferProcessor.inputChannelCount );
-        if( !stream->inputBuffers[i] )
+        if( !stream->inputStream->inputBuffers[i] )
         {
             for( j = 0; j < i; ++j )
-                PaUtil_FreeMemory( stream->inputBuffers[j] );
-            PaUtil_FreeMemory( stream->inputBuffers );
-            (*stream->audioRecorder)->Destroy( stream->audioRecorder );
+                PaUtil_FreeMemory( stream->inputStream->inputBuffers[j] );
+            PaUtil_FreeMemory( stream->inputStream->inputBuffers );
+            (*stream->inputStream->audioRecorder)->Destroy( stream->inputStream->audioRecorder );
             result = paInsufficientMemory;
             goto error;
         }
     }
-    stream->currentInputBuffer = 0;
-    (*stream->inputBufferQueueItf)->RegisterCallback( stream->inputBufferQueueItf,
-                                                      NotifyBufferFreeCallback, &stream->inputSem );
-    sem_init( &stream->inputSem, 0, 0 );
+    stream->inputStream->currentInputBuffer = 0;
+    (*stream->inputStream->inputBufferQueueItf)->RegisterCallback( stream->inputStream->inputBufferQueueItf,
+                                                      NotifyBufferFreeCallback, &stream->inputStream->inputSem );
+    sem_init( &stream->inputStream->inputSem, 0, 0 );
 
 error:
     return result;
@@ -983,17 +1021,17 @@ static void StreamProcessingCallback( void *userData )
 
         if( stream->hasOutput )
         {
-            sem_wait( &stream->outputSem );
+            sem_wait( &stream->outputStream->outputSem );
             PaUtil_SetOutputFrameCount( &stream->bufferProcessor, 0 );
             PaUtil_SetInterleavedOutputChannels( &stream->bufferProcessor, 0,
-                                                 (void*) ((SLint16 **)stream->outputBuffers)[stream->currentOutputBuffer], 0 );
+                                                 (void*) ((SLint16 **)stream->outputStream->outputBuffers)[stream->outputStream->currentOutputBuffer], 0 );
         }
         if( stream->hasInput )
         {
-            sem_wait( &stream->inputSem );
+            sem_wait( &stream->inputStream->inputSem );
             PaUtil_SetInputFrameCount( &stream->bufferProcessor, 0 );
             PaUtil_SetInterleavedInputChannels( &stream->bufferProcessor, 0,
-                                                (void*) ((SLint16 **)stream->inputBuffers)[stream->currentInputBuffer], 0 );
+                                                (void*) ((SLint16 **)stream->inputStream->inputBuffers)[stream->inputStream->currentInputBuffer], 0 );
         }
 
         /* continue processing user buffers if cbresult is pacontinue or if cbresult is  pacomplete and userbuffers aren't empty yet  */
@@ -1009,19 +1047,19 @@ static void StreamProcessingCallback( void *userData )
         {
             if( stream->hasOutput )
             {
-                (*stream->outputBufferQueueItf)->Enqueue( stream->outputBufferQueueItf,
-                                                          (void*) stream->outputBuffers[stream->currentOutputBuffer],
-                                                          framesProcessed * stream->bytesPerFrame
+                (*stream->outputStream->outputBufferQueueItf)->Enqueue( stream->outputStream->outputBufferQueueItf,
+                                                          (void*) stream->outputStream->outputBuffers[stream->outputStream->currentOutputBuffer],
+                                                          framesProcessed * stream->outputStream->bytesPerSample
                                                           * stream->bufferProcessor.outputChannelCount );
-                stream->currentOutputBuffer = (stream->currentOutputBuffer + 1) % numberOfBuffers;
+                stream->outputStream->currentOutputBuffer = (stream->outputStream->currentOutputBuffer + 1) % numberOfBuffers;
             }
             if( stream->hasInput )
             {
-                (*stream->inputBufferQueueItf)->Enqueue( stream->inputBufferQueueItf,
-                                                         (void*) stream->inputBuffers[stream->currentInputBuffer],
-                                                         framesProcessed * stream->bytesPerFrame
+                (*stream->inputStream->inputBufferQueueItf)->Enqueue( stream->inputStream->inputBufferQueueItf,
+                                                         (void*) stream->inputStream->inputBuffers[stream->inputStream->currentInputBuffer],
+                                                         framesProcessed * stream->inputStream->bytesPerSample
                                                          * stream->bufferProcessor.inputChannelCount );
-                stream->currentInputBuffer = (stream->currentInputBuffer + 1) % numberOfBuffers;
+                stream->inputStream->currentInputBuffer = (stream->inputStream->currentInputBuffer + 1) % numberOfBuffers;
             }
         }
 
@@ -1031,14 +1069,14 @@ static void StreamProcessingCallback( void *userData )
         {
             if( stream->hasOutput )
             {
-                (*stream->playerItf)->SetPlayState( stream->playerItf, SL_PLAYSTATE_STOPPED );
-                (*stream->outputBufferQueueItf)->Clear( stream->outputBufferQueueItf );
+                (*stream->outputStream->playerItf)->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_STOPPED );
+                (*stream->outputStream->outputBufferQueueItf)->Clear( stream->outputStream->outputBufferQueueItf );
 
             }
             if( stream->hasInput )
             {
-                (*stream->recorderItf)->SetRecordState( stream->recorderItf, SL_RECORDSTATE_STOPPED );
-                (*stream->inputBufferQueueItf)->Clear( stream->inputBufferQueueItf );
+                (*stream->inputStream->recorderItf)->SetRecordState( stream->inputStream->recorderItf, SL_RECORDSTATE_STOPPED );
+                (*stream->inputStream->inputBufferQueueItf)->Clear( stream->inputStream->inputBufferQueueItf );
             }
             return;
         }
@@ -1046,13 +1084,13 @@ static void StreamProcessingCallback( void *userData )
         {
             if( stream->hasOutput )
             {
-                (*stream->playerItf)->SetPlayState( stream->playerItf, SL_PLAYSTATE_STOPPED );
-                (*stream->outputBufferQueueItf)->Clear( stream->outputBufferQueueItf );
+                (*stream->outputStream->playerItf)->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_STOPPED );
+                (*stream->outputStream->outputBufferQueueItf)->Clear( stream->outputStream->outputBufferQueueItf );
             }
             if( stream->hasInput )
             {
-                (*stream->recorderItf)->SetRecordState( stream->recorderItf, SL_RECORDSTATE_STOPPED );
-                (*stream->inputBufferQueueItf)->Clear( stream->inputBufferQueueItf );
+                (*stream->inputStream->recorderItf)->SetRecordState( stream->inputStream->recorderItf, SL_RECORDSTATE_STOPPED );
+                (*stream->inputStream->inputBufferQueueItf)->Clear( stream->inputStream->inputBufferQueueItf );
             }
 
             stream->isActive = SL_BOOLEAN_FALSE;
@@ -1091,14 +1129,14 @@ static PaError CloseStream( PaStream* s )
 
     if( stream->hasOutput )
     {
-        sem_destroy( &stream->outputSem );
-        (*stream->audioPlayer)->Destroy( stream->audioPlayer );
-        (*stream->outputMixObject)->Destroy( stream->outputMixObject );
+        sem_destroy( &stream->outputStream->outputSem );
+        (*stream->outputStream->audioPlayer)->Destroy( stream->outputStream->audioPlayer );
+        (*stream->outputStream->outputMixObject)->Destroy( stream->outputStream->outputMixObject );
     }
     if( stream->hasInput )
     {
-        sem_destroy( &stream->inputSem );
-        (*stream->audioRecorder)->Destroy( stream->audioRecorder );
+        sem_destroy( &stream->inputStream->inputSem );
+        (*stream->inputStream->audioRecorder)->Destroy( stream->inputStream->audioRecorder );
     }
 
     PaUtil_TerminateBufferProcessor( &stream->bufferProcessor );
@@ -1107,16 +1145,18 @@ static PaError CloseStream( PaStream* s )
     for( i = 0; i < numberOfBuffers; ++i )
     {
         if( stream->hasOutput )
-            PaUtil_FreeMemory( stream->outputBuffers[i] );
+            PaUtil_FreeMemory( stream->outputStream->outputBuffers[i] );
         if( stream->hasInput )
-            PaUtil_FreeMemory( stream->inputBuffers[i] );
+            PaUtil_FreeMemory( stream->inputStream->inputBuffers[i] );
     }
 
     if( stream->hasOutput )
-        PaUtil_FreeMemory( stream->outputBuffers );
+        PaUtil_FreeMemory( stream->outputStream->outputBuffers );
     if( stream->hasInput )
-        PaUtil_FreeMemory( stream->inputBuffers );
+        PaUtil_FreeMemory( stream->inputStream->inputBuffers );
 
+    PaUtil_FreeMemory( stream->outputStream );
+    PaUtil_FreeMemory( stream->inputStream );
     PaUtil_FreeMemory( stream );
     return result;
 }
@@ -1134,36 +1174,38 @@ static PaError StartStream( PaStream *s )
     stream->isActive = SL_BOOLEAN_TRUE;
     stream->doStop = SL_BOOLEAN_FALSE;
     stream->doAbort = SL_BOOLEAN_FALSE;
-    stream->currentOutputBuffer = 0;
-    stream->currentInputBuffer = 0;
+    if( stream->hasOutput )
+        stream->outputStream->currentOutputBuffer = 0;
+    if( stream->hasInput )
+        stream->inputStream->currentInputBuffer = 0;
 
     /* Initialize buffers */
     for( i = 0; i < numberOfBuffers; ++i )
     {
         if( stream->hasOutput )
         {
-            memset( stream->outputBuffers[stream->currentOutputBuffer], 0,
-                    stream->framesPerHostCallback * stream->bytesPerFrame
+            memset( stream->outputStream->outputBuffers[stream->outputStream->currentOutputBuffer], 0,
+                    stream->framesPerHostCallback * stream->outputStream->bytesPerSample
                     * stream->bufferProcessor.outputChannelCount );
-            slResult = (*stream->outputBufferQueueItf)->Enqueue( stream->outputBufferQueueItf,
-                                                                 (void*) stream->outputBuffers[stream->currentOutputBuffer],
-                                                                 stream->framesPerHostCallback * stream->bytesPerFrame
+            slResult = (*stream->outputStream->outputBufferQueueItf)->Enqueue( stream->outputStream->outputBufferQueueItf,
+                                                                 (void*) stream->outputStream->outputBuffers[stream->outputStream->currentOutputBuffer],
+                                                                 stream->framesPerHostCallback * stream->outputStream->bytesPerSample
                                                                  * stream->bufferProcessor.outputChannelCount  );
             if( slResult != SL_RESULT_SUCCESS )
                 goto error;
-            stream->currentOutputBuffer = (stream->currentOutputBuffer + 1) % numberOfBuffers;
+            stream->outputStream->currentOutputBuffer = (stream->outputStream->currentOutputBuffer + 1) % numberOfBuffers;
         }
         if( stream->hasInput )
         {
-            memset( stream->inputBuffers[stream->currentInputBuffer], 0,
-                    stream->framesPerHostCallback * stream->bytesPerFrame * stream->bufferProcessor.inputChannelCount );
-            slResult = (*stream->inputBufferQueueItf)->Enqueue( stream->inputBufferQueueItf,
-                                                                 (void*) stream->inputBuffers[stream->currentInputBuffer],
-                                                                 stream->framesPerHostCallback * stream->bytesPerFrame
+            memset( stream->inputStream->inputBuffers[stream->inputStream->currentInputBuffer], 0,
+                    stream->framesPerHostCallback * stream->inputStream->bytesPerSample * stream->bufferProcessor.inputChannelCount );
+            slResult = (*stream->inputStream->inputBufferQueueItf)->Enqueue( stream->inputStream->inputBufferQueueItf,
+                                                                 (void*) stream->inputStream->inputBuffers[stream->inputStream->currentInputBuffer],
+                                                                 stream->framesPerHostCallback * stream->inputStream->bytesPerSample
                                                                  * stream->bufferProcessor.inputChannelCount  );
             if( slResult != SL_RESULT_SUCCESS )
                 goto error;
-            stream->currentInputBuffer = (stream->currentInputBuffer + 1) % numberOfBuffers;
+            stream->inputStream->currentInputBuffer = (stream->inputStream->currentInputBuffer + 1) % numberOfBuffers;
         }
     }
 
@@ -1178,13 +1220,13 @@ static PaError StartStream( PaStream *s )
     /* Start OpenSL ES devices */
     if( stream->hasOutput )
     {
-        slResult = (*stream->playerItf)->SetPlayState( stream->playerItf, SL_PLAYSTATE_PLAYING );
+        slResult = (*stream->outputStream->playerItf)->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_PLAYING );
         if( slResult != SL_RESULT_SUCCESS )
             goto error;
     }
     if( stream->hasInput )
     {
-        slResult = (*stream->recorderItf)->SetRecordState( stream->recorderItf, SL_RECORDSTATE_RECORDING);
+        slResult = (*stream->inputStream->recorderItf)->SetRecordState( stream->inputStream->recorderItf, SL_RECORDSTATE_RECORDING);
         if( slResult != SL_RESULT_SUCCESS )
             goto error;
     }
@@ -1205,18 +1247,18 @@ static PaError StopStream( PaStream *s )
         if( stream->hasOutput )
         {
             do {
-                (*stream->outputBufferQueueItf)->GetState( stream->outputBufferQueueItf, &state);
+                (*stream->outputStream->outputBufferQueueItf)->GetState( stream->outputStream->outputBufferQueueItf, &state);
             } while( state.count > 0 );
-            (*stream->playerItf)->SetPlayState( stream->playerItf, SL_PLAYSTATE_STOPPED );
-            (*stream->outputBufferQueueItf)->Clear( stream->outputBufferQueueItf );
+            (*stream->outputStream->playerItf)->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_STOPPED );
+            (*stream->outputStream->outputBufferQueueItf)->Clear( stream->outputStream->outputBufferQueueItf );
         }
         if( stream->hasInput )
         {
             do {
-                (*stream->inputBufferQueueItf)->GetState( stream->inputBufferQueueItf, &state);
+                (*stream->inputStream->inputBufferQueueItf)->GetState( stream->inputStream->inputBufferQueueItf, &state);
             } while( state.count > 0 );
-            (*stream->recorderItf)->SetRecordState( stream->recorderItf, SL_RECORDSTATE_STOPPED );
-            (*stream->inputBufferQueueItf)->Clear( stream->inputBufferQueueItf );
+            (*stream->inputStream->recorderItf)->SetRecordState( stream->inputStream->recorderItf, SL_RECORDSTATE_STOPPED );
+            (*stream->inputStream->inputBufferQueueItf)->Clear( stream->inputStream->inputBufferQueueItf );
         }
         stream->isActive = SL_BOOLEAN_FALSE;
         stream->isStopped = SL_BOOLEAN_TRUE;
@@ -1248,9 +1290,9 @@ static PaError AbortStream( PaStream *s )
 
     /* stop immediately so enqueue has no effect */
     if( stream->hasOutput )
-        (*stream->playerItf)->SetPlayState( stream->playerItf, SL_PLAYSTATE_STOPPED );
+        (*stream->outputStream->playerItf)->SetPlayState( stream->outputStream->playerItf, SL_PLAYSTATE_STOPPED );
     if( stream->hasInput)
-        (*stream->recorderItf)->SetRecordState( stream->recorderItf, SL_RECORDSTATE_STOPPED );
+        (*stream->inputStream->recorderItf)->SetRecordState( stream->inputStream->recorderItf, SL_RECORDSTATE_STOPPED );
 
     stream->isActive = SL_BOOLEAN_FALSE;
     stream->isStopped = SL_BOOLEAN_TRUE;
@@ -1294,18 +1336,18 @@ static PaError ReadStream( PaStream* s,
 
     while( frames > 0 )
     {
-        sem_wait( &stream->inputSem );
+        sem_wait( &stream->inputStream->inputSem );
         framesToRead = PA_MIN( stream->framesPerHostCallback, frames );
         PaUtil_SetInputFrameCount( &stream->bufferProcessor, framesToRead );
         PaUtil_SetInterleavedInputChannels( &stream->bufferProcessor, 0,
-                                            stream->inputBuffers[stream->currentInputBuffer], 0 );
+                                            stream->inputStream->inputBuffers[stream->inputStream->currentInputBuffer], 0 );
 
-        (*stream->inputBufferQueueItf)->Enqueue( stream->inputBufferQueueItf,
-                                                 stream->inputBuffers[stream->currentInputBuffer],
-                                                 framesToRead * stream->bytesPerFrame
+        (*stream->inputStream->inputBufferQueueItf)->Enqueue( stream->inputStream->inputBufferQueueItf,
+                                                 stream->inputStream->inputBuffers[stream->inputStream->currentInputBuffer],
+                                                 framesToRead * stream->inputStream->bytesPerSample
                                                  * stream->bufferProcessor.inputChannelCount );
          PaUtil_CopyInput( &stream->bufferProcessor, &userBuffer, framesToRead );
-         stream->currentInputBuffer = (stream->currentInputBuffer + 1) % numberOfBuffers;
+         stream->inputStream->currentInputBuffer = (stream->inputStream->currentInputBuffer + 1) % numberOfBuffers;
 
          frames -= framesToRead;
     }
@@ -1323,16 +1365,16 @@ static PaError WriteStream( PaStream* s,
 
     while( frames > 0 )
     {
-        sem_wait( &stream->outputSem );
+        sem_wait( &stream->outputStream->outputSem );
         framesToWrite = PA_MIN( stream->framesPerHostCallback, frames );
         PaUtil_SetOutputFrameCount( &stream->bufferProcessor, framesToWrite );
         PaUtil_SetInterleavedOutputChannels( &stream->bufferProcessor, 0,
-                                             stream->outputBuffers[stream->currentOutputBuffer], 0 );
+                                             stream->outputStream->outputBuffers[stream->outputStream->currentOutputBuffer], 0 );
         PaUtil_CopyOutput( &stream->bufferProcessor, &userBuffer, framesToWrite);
-        (*stream->outputBufferQueueItf)->Enqueue( stream->outputBufferQueueItf, stream->outputBuffers[stream->currentOutputBuffer],
-                                                  framesToWrite * stream->bytesPerFrame
+        (*stream->outputStream->outputBufferQueueItf)->Enqueue( stream->outputStream->outputBufferQueueItf, stream->outputStream->outputBuffers[stream->outputStream->currentOutputBuffer],
+                                                  framesToWrite * stream->outputStream->bytesPerSample
                                                   * stream->bufferProcessor.outputChannelCount );
-        stream->currentOutputBuffer = (stream->currentOutputBuffer + 1) % numberOfBuffers;
+        stream->outputStream->currentOutputBuffer = (stream->outputStream->currentOutputBuffer + 1) % numberOfBuffers;
         frames -= framesToWrite;
     }
     return paNoError;
@@ -1343,7 +1385,7 @@ static signed long GetStreamReadAvailable( PaStream* s )
     OpenslesStream *stream = (OpenslesStream*)s;
     SLAndroidSimpleBufferQueueState state;
 
-    (*stream->inputBufferQueueItf)->GetState( stream->inputBufferQueueItf, &state );
+    (*stream->inputStream->inputBufferQueueItf)->GetState( stream->inputStream->inputBufferQueueItf, &state );
     return stream->framesPerHostCallback * ( numberOfBuffers - state.count );
 }
 
@@ -1352,7 +1394,7 @@ static signed long GetStreamWriteAvailable( PaStream* s )
     OpenslesStream *stream = (OpenslesStream*)s;
     SLAndroidSimpleBufferQueueState state;
 
-    (*stream->outputBufferQueueItf)->GetState( stream->outputBufferQueueItf, &state );
+    (*stream->outputStream->outputBufferQueueItf)->GetState( stream->outputStream->outputBufferQueueItf, &state );
     return stream->framesPerHostCallback * ( numberOfBuffers - state.count );
 }
 
