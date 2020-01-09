@@ -678,7 +678,7 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         if( IsOutputSampleRateSupported( openslesHostApi, sampleRate * 1000 ) != paNoError )
             return paInvalidSampleRate;
 
-        hostOutputSampleFormat = PaUtil_SelectClosestAvailableFormat( paInt16, outputSampleFormat );
+        hostOutputSampleFormat = PaUtil_SelectClosestAvailableFormat( paInt24, outputSampleFormat );
     }
     else
     {
@@ -735,7 +735,7 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     stream->streamRepresentation.streamInfo.sampleRate = sampleRate;
     stream->isBlocking = streamCallback ? SL_BOOLEAN_FALSE : SL_BOOLEAN_TRUE;
     stream->framesPerHostCallback = framesPerHostBuffer;
-    stream->bytesPerFrame = sizeof(SLint16);
+    stream->bytesPerFrame = Pa_GetSampleSize(paInt24);
     stream->cbFlags = 0;
     stream->isStopped = SL_BOOLEAN_TRUE;
     stream->isActive = SL_BOOLEAN_FALSE;
@@ -784,7 +784,7 @@ static PaError InitializeOutputStream(PaOpenslesHostApiRepresentation *openslesH
     const SLuint32 channelMasks[] = { SL_SPEAKER_FRONT_CENTER, SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT };
     SLDataLocator_AndroidSimpleBufferQueue outputBQLocator = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, numberOfBuffers };
     SLDataFormat_PCM  formatPcm = { SL_DATAFORMAT_PCM, stream->bufferProcessor.outputChannelCount,
-                                    sampleRate * 1000.0, SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
+                                    sampleRate * 1000.0, SL_PCMSAMPLEFORMAT_FIXED_24, SL_PCMSAMPLEFORMAT_FIXED_24,
                                     channelMasks[stream->bufferProcessor.outputChannelCount - 1], SL_BYTEORDER_LITTLEENDIAN };
     SLDataSource audioSrc = { &outputBQLocator, &formatPcm };
 
